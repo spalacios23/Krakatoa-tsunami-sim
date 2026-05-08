@@ -1,5 +1,22 @@
+"""
+Tsunami simulation around Krakatau using real bathymetry + 2D animation.
+
+Linear shallow-water on a flat Cartesian grid, pseudo-spectral spatial
+derivatives, RK2 in time, sponge-layer coasts, absorbing edge buffer.
+Reference: Choi et al. (2003), eqs. 4-6 in flat-Cartesian form, plus
+f-plane Coriolis. Real bathymetry from NOAA ETOPO 2022 (60-arc-second).
+
+Bathymetry download (run once, ~250 MB):
+    wget https://www.ngdc.noaa.gov/mgg/global/relief/ETOPO2022/data/60s/60s_surface_elev_gtif/ETOPO_2022_v1_60s_N90W180_surface.tif
+
+Install once:
+    pip install numpy scipy matplotlib xarray rasterio imageio imageio-ffmpeg
+
+Run:
+    python tsunami_sim_local.py --bathy-file ETOPO_2022_v1_60s_N90W180_surface.tif
+"""
+
 import argparse
-import os
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as manim
@@ -15,7 +32,7 @@ g                  = 9.81
 H_DEEP             = 4000.0
 H_MIN              = 10.0
 T_MAX_DEFAULT      = 14 * 3600
-SPONGE_LAND        = 8e-3 * (0.75)
+SPONGE_LAND        = 8e-3 * 0.75
 SPONGE_EDGE        = 1.5e-2
 EDGE_BUFFER_FRAC   = 0.10
 
@@ -27,11 +44,6 @@ KRAK_LAT_DEG       = -6.1
 KRAK_LON_DEG       = 105.4
 KRAK_LAT           = np.deg2rad(KRAK_LAT_DEG)
 KRAK_LON           = np.deg2rad(KRAK_LON_DEG)
-
-# ETOPO 2022 30 arc-sec single global tile via NOAA OPeNDAP. Streams
-# subsets so only what we need gets downloaded.
-ETOPO_URL = ("https://www.ngdc.noaa.gov/thredds/dodsC/global/ETOPO2022/30s/"
-             "30s_surface_elev_netcdf/ETOPO_2022_v1_30s_N90W180_surface.nc")
 
 
 # ============================================================
@@ -45,7 +57,7 @@ STATIONS = [
     ("Rodriguez Is.",   -19.67,  63.42,   6.5,    1.8,   'runup',  6.67),
     ("Mauritius",       -20.17,  57.50,   6.5,    0.9,   'runup',  7.3),
     ("Cossack",         -20.68, 117.20,   5.25,   1.5,   'runup',  3.0),
-    ("Geraldton",       -28.77, 114.60,   9.25,   1.0,   'runup',  4.0)
+    ("Geraldton",       -28.77, 114.60,   9.25,   1.0,   'runup',  4.0),
 ]
 
 
@@ -84,93 +96,33 @@ def project_station(lat_deg, lon_deg, src_x, src_y):
 
 
 # ============================================================
-# 4. Bathymetry: ETOPO via OPeNDAP, or synthetic fallback
+# 4. Load ETOPO bathymetry from local GeoTIFF
 # ============================================================
 def load_etopo_from_file(path):
-    """Load ETOPO from a local file. Auto-detects TIFF (uses rasterio) vs
-    NetCDF (uses xarray). Returns an xarray DataArray with dims (lat, lon)
-    of elevation in meters, ascending in both lat and lon."""
+    """Load ETOPO from a local GeoTIFF. Returns an xarray DataArray with
+    dims (lat, lon) of elevation in meters, ascending in both axes."""
     import xarray as xr
+    import rasterio
     print(f"Loading bathymetry from {path}...")
-
-    # NetCDF -- try xarray first
-    if path.lower().endswith(('.nc', '.netcdf', '.nc4')):
-        ds = xr.open_dataset(path)
-        # ETOPO files use 'z' for elevation; some derivatives use 'elevation'
-        var_name = 'z' if 'z' in ds.variables else list(ds.data_vars)[0]
-        da = ds[var_name]
-        print(f"  shape: {da.shape}, var: {var_name}")
-        return da
-
-    # GeoTIFF -- needs rasterio. ETOPO TIFFs have a single band of int16
-    # elevations and proper geo-referencing.
-    if path.lower().endswith(('.tif', '.tiff')):
-        try:
-            import rasterio
-        except ImportError:
-            raise RuntimeError(
-                "Loading GeoTIFF needs rasterio. Install with:\n"
-                "    pip install rasterio")
-        with rasterio.open(path) as src:
-            print(f"  shape: {src.shape}, crs: {src.crs}, "
-                  f"bounds: {src.bounds}")
-            data = src.read(1)                       # (rows, cols)
-            # Build lat/lon coordinate vectors from the affine transform.
-            # Rows go top->bottom, so lat[0] is the NORTH edge (largest lat).
-            transform = src.transform
-            cols = np.arange(src.width)
-            rows = np.arange(src.height)
-            # Pixel CENTER coordinates
-            lons = transform.c + (cols + 0.5) * transform.a
-            lats = transform.f + (rows + 0.5) * transform.e
-            # Flip rows so lat is ascending (south->north)
-            if lats[0] > lats[-1]:
-                lats = lats[::-1]
-                data = data[::-1, :]
-        # Return as a DataArray for uniform downstream handling
-        da = xr.DataArray(data, dims=('lat', 'lon'),
-                           coords={'lat': lats, 'lon': lons})
-        print(f"  lat range: {lats[0]:.2f} to {lats[-1]:.2f}, "
-              f"lon range: {lons[0]:.2f} to {lons[-1]:.2f}")
-        return da
-
-    raise ValueError(f"Unrecognized file extension: {path}. Use .nc or .tif.")
-
-
-def load_etopo_subset(cache_path=None):
-    """Load ETOPO 2022 30s elevation in a lat/lon box big enough to cover
-    the paper's stations.  Returns an xarray DataArray, dims (lat, lon),
-    elevation in meters (positive = above sea level)."""
-    if cache_path and os.path.exists(cache_path):
-        print(f"Loading cached bathymetry: {cache_path}")
-        import xarray as xr
-        return xr.open_dataarray(cache_path)
-
-    import xarray as xr
-    print(f"Streaming ETOPO subset from NOAA (slow on first run)...")
-    print(f"  URL: {ETOPO_URL}")
-
-    LAT_MIN, LAT_MAX = -45, 30
-    LON_MIN, LON_MAX = 30, 165
-
-    ds = xr.open_dataset(ETOPO_URL)
-    sub = ds['z'].sel(lat=slice(LAT_MIN, LAT_MAX),
-                       lon=slice(LON_MIN, LON_MAX))
-    print(f"  subset shape: {sub.shape} (lat x lon)")
-    print(f"  downloading...")
-    sub = sub.load()
-    print(f"  done. depth range: {float(sub.min())} to {float(sub.max())} m")
-
-    if cache_path:
-        sub.to_netcdf(cache_path)
-        print(f"  cached: {cache_path}")
-    return sub
+    with rasterio.open(path) as src:
+        print(f"  shape: {src.shape}, bounds: {src.bounds}")
+        data = src.read(1)
+        transform = src.transform
+        cols = np.arange(src.width)
+        rows = np.arange(src.height)
+        lons = transform.c + (cols + 0.5) * transform.a
+        lats = transform.f + (rows + 0.5) * transform.e
+        if lats[0] > lats[-1]:
+            lats = lats[::-1]
+            data = data[::-1, :]
+    return xr.DataArray(data, dims=('lat', 'lon'),
+                         coords={'lat': lats, 'lon': lons})
 
 
 def project_etopo_to_grid(etopo_da, X_grid, Y_grid, src_x, src_y):
-    """Project ETOPO (lat, lon) onto our flat Cartesian grid via inverse
-    azimuthal-equidistant projection + bilinear interp. Returns h(x,y)
-    where h>0 in water and h<=0 on land."""
+    """Project ETOPO (lat, lon) onto the flat Cartesian grid via inverse
+    azimuthal-equidistant + bilinear interp. Returns h(x,y) where h>0 in
+    water and h<=0 on land."""
     print("Projecting ETOPO onto flat Cartesian grid...")
     lat_grid, lon_grid = latlon_from_grid(X_grid, Y_grid, src_x, src_y)
     lon_grid = ((lon_grid + 180) % 360) - 180
@@ -186,38 +138,18 @@ def project_etopo_to_grid(etopo_da, X_grid, Y_grid, src_x, src_y):
     interp = RegularGridInterpolator(
         (lats, lons), z,
         method='linear', bounds_error=False, fill_value=-H_DEEP)
-
     pts = np.stack([lat_grid.ravel(), lon_grid.ravel()], axis=-1)
     elev = interp(pts).reshape(lat_grid.shape)
-    h = -elev   # depth positive in water
-    return h
-
-
-def synthetic_bathymetry(X, Y, L_):
-    """Fallback: handcrafted continents (offline / --no-bathy)."""
-    h = np.full_like(X, H_DEEP)
-    src_x, src_y = L_ / 2, L_ / 2
-    edge_dist = np.minimum.reduce([X, L_ - X, Y, L_ - Y])
-    h = H_MIN + (h - H_MIN) * np.clip(edge_dist / 300e3, 0, 1)
-    continents = [
-        (src_x - 3000e3, src_y + 3000e3, 1500e3, 1200e3, 400),
-        (src_x - 5000e3, src_y - 1000e3, 1200e3, 2500e3, 400),
-        (src_x + 3500e3, src_y - 2200e3, 1500e3, 1200e3, 400),
-        (src_x + 1500e3, src_y + 3500e3,  600e3,  500e3, 200),
-    ]
-    for cx, cy, rx, ry, elev in continents:
-        d2 = ((X - cx) / rx) ** 2 + ((Y - cy) / ry) ** 2
-        h -= (H_DEEP + elev) * np.exp(-d2 * 1.5) * (d2 < 2.0)
-    return h
+    return -elev  # depth positive in water
 
 
 # ============================================================
 # 5. Build grid + bathymetry + sponge
 # ============================================================
-def build_grid_and_bathymetry(N, use_etopo=True, cache_path=None, bathy_file=None):
+def build_grid_and_bathymetry(N, bathy_file):
     dx = L / N
-    x  = np.linspace(0, L, N, endpoint=False)
-    y  = np.linspace(0, L, N, endpoint=False)
+    x = np.linspace(0, L, N, endpoint=False)
+    y = np.linspace(0, L, N, endpoint=False)
     X, Y = np.meshgrid(x, y, indexing='xy')
     src_x, src_y = L / 2, L / 2
 
@@ -230,40 +162,18 @@ def build_grid_and_bathymetry(N, use_etopo=True, cache_path=None, bathy_file=Non
     k_norm = np.sqrt(K2) / k_max
     spec_damper = np.exp(-36.0 * k_norm**20)
 
-    if use_etopo:
-        try:
-            # PRIORITIZE LOCAL FILE: If bathy_file is provided, use it.
-            # Only stream if no local file is specified.
-            if bathy_file and os.path.exists(bathy_file):
-                etopo = load_etopo_from_file(bathy_file)
-            else:
-                if not bathy_file:
-                    print("No local bathy file provided. Attempting stream...")
-                else:
-                    print(f"Provided file {bathy_file} not found. Attempting stream...")
-                etopo = load_etopo_subset(cache_path)
-                
-            h = project_etopo_to_grid(etopo, X, Y, src_x, src_y)
-        except Exception as e:
-            print(f"\nBathymetry load failed ({type(e).__name__}: {e})")
-            print("Falling back to synthetic bathymetry.\n")
-            h = synthetic_bathymetry(X, Y, L)
-    else:
-        h = synthetic_bathymetry(X, Y, L)
-
-    # Light smoothing prevents spectral ringing at sharp coastlines without
-    # blurring shelves.
+    etopo = load_etopo_from_file(bathy_file)
+    h = project_etopo_to_grid(etopo, X, Y, src_x, src_y)
     h = gaussian_filter(h, sigma=0.7)
 
     land_mask = h <= 0
     h_water = np.maximum(h, H_MIN)
 
-        # Sponge: was eating the entire continental shelf. Reduce coastal ramp
-    # so we only damp very-near-coast cells, leaving shelf for edge waves.
+    # Sponge: damps near coasts and at the outer absorbing edge
     dist_to_land = distance_transform_edt(~land_mask)
-    coast_ramp = np.clip(1.0 - dist_to_land / 1, 0, 1)   # was /4 -- now only 1 cell
+    coast_ramp = np.clip(1.0 - dist_to_land / 1, 0, 1)
     coast_sponge = SPONGE_LAND * (land_mask.astype(float)
-                                + coast_ramp * (~land_mask))
+                                   + coast_ramp * (~land_mask))
 
     edge_w = max(12, int(EDGE_BUFFER_FRAC * N))
     ii = np.arange(N)[:, None] * np.ones((1, N))
@@ -272,8 +182,7 @@ def build_grid_and_bathymetry(N, use_etopo=True, cache_path=None, bathy_file=Non
     edge_ramp = np.clip(1.0 - edge_dist / edge_w, 0, 1)
     edge_sponge = SPONGE_EDGE * edge_ramp ** 2
 
-    sponge = coast_sponge + edge_sponge
-    sponge = gaussian_filter(sponge, sigma=1.0)
+    sponge = gaussian_filter(coast_sponge + edge_sponge, sigma=1.0)
 
     return dict(X=X, Y=Y, dx=dx,
                 KX=KX, KY=KY, K2=K2,
@@ -316,8 +225,6 @@ def simulate(gd, station_ij, N, T_MAX, n_snapshots=200):
     snap_every = max(1, steps // n_snapshots)
     print(f"Grid: {N}x{N}, dx={dx/1e3:.1f} km, dt={dt:.1f} s, "
           f"steps={steps}, c_max={c_max:.0f} m/s, T={T_MAX/3600:.0f}h")
-    print(f"Snapshots: every {snap_every} steps "
-          f"(~{steps//snap_every} animation frames)")
 
     def ddx(f):
         return np.fft.ifft2(1j * KX * np.fft.fft2(f) * dealias).real
@@ -333,51 +240,31 @@ def simulate(gd, station_ij, N, T_MAX, n_snapshots=200):
         deta[land_mask] = 0.0
         return deta, dM, dN
 
-    # Move the source into open Indian Ocean, southwest of the strait, to
-    # avoid Sumatra/Java cutting off most of the radiation. Krakatau is at
-    # (src_x, src_y); we shift to ~150 km SW into deep water.
-    src_x_eff = src_x - 150e3       # west
-    src_y_eff = src_y - 150e3       # south
-    print(f"  Source shifted SW into open ocean: "
-        f"({src_x_eff/1e3:.0f}, {src_y_eff/1e3:.0f}) km")
+    # Source shifted SW into open Indian Ocean to escape the Sunda Strait,
+    # which is sub-grid at our resolution. Far-field results depend on
+    # displaced volume, not exact source position (paper Sect. 4).
+    src_x_eff = src_x - 150e3
+    src_y_eff = src_y - 150e3
 
-    # Sanity check the new location
-    i_eff = int(round(src_y_eff / dx))
-    j_eff = int(round(src_x_eff / dx))
-    print(f"  depth at shifted source: {h_water[i_eff, j_eff]:.0f} m, "
-        f"land cells in 10-cell box: "
-        f"{land_mask[i_eff-10:i_eff+11, j_eff-10:j_eff+11].sum()}/441")
-
-    # ---- Initial condition: square depression matching paper's geometry ----
-# Paper Sect. 4: 7.2 x 7.2 km flat square, depth 222 m, vol 11.5 km^3.
-# At dx=31 km we can't resolve 7.2 km, so we use a square that's at least
-# 2 cells wide and scale the depth to preserve the displaced volume.
+    # Square depression matching paper geometry, scaled to preserve volume.
+    # Paper: 7.2 km square, 222 m depth, 11.5 km^3. Our dx=31 km can't
+    # resolve 7.2 km, so we use a 2-cell-wide square with depth scaled
+    # to keep the displaced volume at 11.5 km^3.
     SRC_VOLUME_TARGET = 11.5e9
-    src_half = max(2 * dx, 3.6e3)              # at least 2 cells half-width
-    side = 2 * src_half                         # full side
-    src_amp = 2*SRC_VOLUME_TARGET / (side ** 2)   # depth s.t. amp*side^2 = vol
+    src_half = max(2 * dx, 3.6e3)
+    side = 2 * src_half
+    src_amp = 2 * SRC_VOLUME_TARGET / (side ** 2)
 
-    # Soft-edged square: flat top across the interior, tanh shoulders one
-    # cell wide so the FFT doesn't ring at the edges.
     fall = dx
     rx = np.abs(X - src_x_eff)
     ry = np.abs(Y - src_y_eff)
     sx = 0.5 * (1 - np.tanh((rx - src_half) / fall))
     sy = 0.5 * (1 - np.tanh((ry - src_half) / fall))
     eta = -src_amp * sx * sy
-
-    vol_before = -np.sum(eta) * dx * dx
     eta[land_mask] = 0.0
-    vol_after = -np.sum(eta) * dx * dx
-    print(f"  Volume before land mask: {vol_before/1e9:.2f} km^3")
-    print(f"  Volume after  land mask: {vol_after/1e9:.2f} km^3 "
-        f"({100*vol_after/vol_before:.0f}% retained)")
-
     eta = filt(eta)
-    M  = np.zeros_like(eta)
+    M = np.zeros_like(eta)
     Nf = np.zeros_like(eta)
-
-    init_vol = -np.sum(eta) * dx * dx
 
     gauges = {k: [] for k, ij in enumerate(station_ij) if ij is not None}
     times = []
@@ -426,9 +313,9 @@ def simulate(gd, station_ij, N, T_MAX, n_snapshots=200):
 def analyze_gauge(t, eta_ts):
     abs_eta = np.abs(eta_ts)
     peak = abs_eta.max()
-    if peak < 0.005:                # was 0.02
+    if peak < 0.005:
         return None, peak
-    threshold = max(0.005, 0.10 * peak)   # was 0.02
+    threshold = max(0.005, 0.10 * peak)
     arrival_idx = np.argmax(abs_eta > threshold)
     return t[arrival_idx] / 3600, peak
 
@@ -445,13 +332,8 @@ def plot_gauges(t, gauges, station_ij, save_path=None):
     axes = np.atleast_1d(axes).flatten()
     t_h = t / 3600
 
-    # Compute a sensible shared y-range. Use the 99th percentile of the
-    # largest gauge so an outlier spike doesn't squash everything else.
     all_peaks = [np.abs(gauges[k]).max() for k in active]
-    y_lim = max(all_peaks) * 1.1               # 10% headroom
-    # If you want detail on quiet stations to be visible too, use this
-    # instead: a percentile so outliers don't dominate.
-    # y_lim = np.percentile([np.abs(gauges[k]) for k in active], 99) * 1.5
+    y_lim = max(all_peaks) * 1.1
 
     for idx, k in enumerate(active):
         ax = axes[idx]
@@ -467,7 +349,6 @@ def plot_gauges(t, gauges, station_ij, save_path=None):
                        alpha=0.7, label=f'tt_sim={tt_sim:.2f}h')
         ax.axhline(amp_obs, color='orange', linestyle=':', linewidth=0.5)
         ax.axhline(-amp_obs, color='orange', linestyle=':', linewidth=0.5)
-        # Annotate the simulated peak amplitude in the corner
         ax.text(0.02, 0.95, f'sim peak: {amp_sim:.3f} m',
                 transform=ax.transAxes, fontsize=7, va='top',
                 bbox=dict(boxstyle='round', facecolor='white',
@@ -475,7 +356,7 @@ def plot_gauges(t, gauges, station_ij, save_path=None):
         ax.set_title(f'{name}  ({lat:+.1f}°, {lon:+.1f}°)  '
                      f'amp_obs={amp_obs}m ({kind})', fontsize=9)
         ax.set_ylabel('η (m)', fontsize=8)
-        ax.set_ylim(-y_lim, y_lim)             # SHARED Y-RANGE
+        ax.set_ylim(-y_lim, y_lim)
         ax.grid(alpha=0.3)
         ax.legend(fontsize=7, loc='upper right')
         ax.tick_params(labelsize=8)
@@ -499,13 +380,11 @@ def plot_gauges(t, gauges, station_ij, save_path=None):
 # ============================================================
 def render_animation(snapshots, snap_times, gd, station_ij, save_path,
                      fps=15):
-    """Animate η(x,y,t). Land in brown, water in red/blue diverging,
+    """Animate eta(x,y,t). Land in brown, water in red/blue diverging,
     stations marked yellow, source as a red star."""
     print(f"Rendering animation -> {save_path} ...")
     X, Y = gd['X'], gd['Y']
     land_mask = gd['land_mask']
-
-    late = snapshots[len(snapshots) // 4:]
     vmax = 0.05
 
     fig, ax = plt.subplots(figsize=(9, 8), facecolor='black')
@@ -580,15 +459,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('-N', type=int, default=N_DEFAULT)
     p.add_argument('--hours', type=float, default=T_MAX_DEFAULT/3600)
-    p.add_argument('--no-bathy', action='store_true',
-                   help='skip ETOPO download, use synthetic bathymetry')
-    p.add_argument('--cache', type=str, default='etopo_subset.nc',
-                   help='local cache file for ETOPO subset (empty to disable)')
-    
-    # 1. THIS TELLS THE SCRIPT TO LOOK FOR YOUR FLAG
-    p.add_argument('--bathy-file', type=str, default=None,
-                   help='load from a local file (TIFF or NetCDF)')
-                   
+    p.add_argument('--bathy-file', type=str, required=True,
+                   help='path to ETOPO GeoTIFF')
     p.add_argument('--save-plot', type=str, default='gauges.png')
     p.add_argument('--save-anim', type=str, default='tsunami.mp4',
                    help='MP4 of the wave; empty string to skip')
@@ -598,22 +470,7 @@ def main():
     N = args.N
     T_MAX = args.hours * 3600
 
-    cache = args.cache if args.cache else None
-    
-    # 2. THIS PASSES THE FLAG INTO THE BUILDER
-    gd = build_grid_and_bathymetry(
-        N, use_etopo=(not args.no_bathy), cache_path=cache, bathy_file=args.bathy_file)
-
-    i_src = int(round(gd['src_y'] / gd['dx']))
-    j_src = int(round(gd['src_x'] / gd['dx']))
-    print(f"\nBathymetry sanity check (source at i={i_src}, j={j_src}):")
-    print(f"  depth at source: {gd['h_water'][i_src, j_src]:.1f} m")
-    print(f"  depths in 5-cell radius: "
-      f"min={gd['h_water'][i_src-5:i_src+6, j_src-5:j_src+6].min():.1f}, "
-      f"max={gd['h_water'][i_src-5:i_src+6, j_src-5:j_src+6].max():.1f}")
-    print(f"  land cells in 10-cell box: "
-      f"{gd['land_mask'][i_src-10:i_src+11, j_src-10:j_src+11].sum()} / 441")
-        
+    gd = build_grid_and_bathymetry(N, bathy_file=args.bathy_file)
     src_x, src_y = gd['src_x'], gd['src_y']
 
     print("\nStation placement (great-circle from Krakatau):")
@@ -640,30 +497,26 @@ def main():
                   f"grid=({i2},{j2}){note}")
         station_arc.append(arc)
 
-    t, gauges, snapshots, snap_times = simulate(
-        gd, station_ij, N, T_MAX)
+    t, gauges, snapshots, snap_times = simulate(gd, station_ij, N, T_MAX)
 
     print("\n" + "=" * 96)
     print(f"{'Station':<18}{'arc(km)':>9}{'tt_obs':>9}{'tt_paper':>10}"
-          f"{'tt_sim':>9}{'amp_obs':>10}{'kind':>7}{'amp_sim':>10}{'note':>20}")
+          f"{'tt_sim':>9}{'amp_obs':>10}{'kind':>7}{'amp_sim':>10}")
     print("-" * 96)
     for k, (name, lat, lon, tt_obs, amp_obs, kind, tt_paper) in enumerate(STATIONS):
         arc_km = station_arc[k] / 1e3
         if station_ij[k] is None:
             print(f"{name:<18}{arc_km:>9.0f}{tt_obs:>9.2f}{tt_paper:>10.2f}"
-                  f"{'--':>9}{amp_obs:>10.2f}{kind:>7}{'--':>10}"
-                  f"{'out of domain':>20}")
+                  f"{'--':>9}{amp_obs:>10.2f}{kind:>7}{'--':>10}")
             continue
         tt_sim, amp_sim = analyze_gauge(t, gauges[k])
         tt_str = f"{tt_sim:.2f}" if tt_sim else "n/a"
-        amp_str = f"{amp_sim:.3f}"
         print(f"{name:<18}{arc_km:>9.0f}{tt_obs:>9.2f}{tt_paper:>10.2f}"
-              f"{tt_str:>9}{amp_obs:>10.2f}{kind:>7}{amp_str:>10}{'':>20}")
+              f"{tt_str:>9}{amp_obs:>10.2f}{kind:>7}{amp_sim:>10.3f}")
     print("=" * 96)
 
     if not args.no_plot:
         plot_gauges(t, gauges, station_ij, save_path=args.save_plot)
-
     if args.save_anim:
         render_animation(snapshots, snap_times, gd, station_ij,
                          save_path=args.save_anim)
